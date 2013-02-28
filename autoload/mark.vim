@@ -10,8 +10,23 @@
 " Dependencies:
 "  - SearchSpecial.vim autoload script (optional, for improved search messages).
 "
-" Version:     2.6.4
+" Version:     2.7.2
 " Changes:
+" 15-Oct-2012, Ingo Karkat
+" - Issue an error message "No marks defined" instead of moving the cursor by
+"   one character when there are no marks (e.g. initially or after :MarkClear).
+" - Enable custom integrations via new mark#GetNum() and mark#GetPattern()
+"   functions.
+"
+" 13-Sep-2012, Ingo Karkat
+" - Enable alternative * / # mappings that do not remember the last search type
+"   by adding optional search function argument to mark#SearchNext().
+"
+" 04-Jul-2012, Ingo Karkat
+" - ENH: Handle on-the-fly change of mark highlighting via mark#ReInit(), which
+"   truncates / expands s:pattern and corrects the indices. Also, w:mwMatch List
+"   size mismatches must be handled in s:MarkMatch().
+"
 " 23-Apr-2012, Ingo Karkat + fanhe
 " - Force case via \c / \C instead of temporarily unsetting 'smartcase'.
 " - Allow to override 'ignorecase' setting via g:mwIgnoreCase. Thanks to fanhe
@@ -292,6 +307,18 @@ endfunction
 function! s:MarkMatch( indices, expr )
 	if ! exists('w:mwMatch')
 		let w:mwMatch = repeat([0], s:markNum)
+	elseif len(w:mwMatch) != s:markNum
+		" The number of marks has changed.
+		if len(w:mwMatch) > s:markNum
+			" Truncate the matches.
+			for l:match in filter(w:mwMatch[s:markNum : ], 'v:val > 0')
+				silent! call matchdelete(l:match)
+			endfor
+			let w:mwMatch = w:mwMatch[0 : (s:markNum - 1)]
+		else
+			" Expand the matches.
+			let w:mwMatch += repeat([0], (s:markNum - len(w:mwMatch)))
+		endif
 	endif
 
 	for l:index in a:indices
@@ -605,19 +632,31 @@ function! mark#SearchCurrentMark( isBackward )
 	endif
 endfunction
 
-function! s:ErrorMessage( searchType, searchPattern, isBackward )
-	if &wrapscan
-		let v:errmsg = a:searchType . ' not found: ' . a:searchPattern
-	else
-		let v:errmsg = printf('%s search hit %s without match for: %s', a:searchType, (a:isBackward ? 'TOP' : 'BOTTOM'), a:searchPattern)
-	endif
+function! s:ErrorMsg( text )
+	let v:errmsg = a:text
 	echohl ErrorMsg
 	echomsg v:errmsg
 	echohl None
 endfunction
+function! s:NoMarkErrorMessage()
+	call s:ErrorMsg('No marks defined')
+endfunction
+function! s:ErrorMessage( searchType, searchPattern, isBackward )
+	if &wrapscan
+		let l:errmsg = a:searchType . ' not found: ' . a:searchPattern
+	else
+		let l:errmsg = printf('%s search hit %s without match for: %s', a:searchType, (a:isBackward ? 'TOP' : 'BOTTOM'), a:searchPattern)
+	endif
+	call s:ErrorMsg(l:errmsg)
+endfunction
 
 " Wrapper around search() with additonal search and error messages and "wrapscan" warning.
 function! s:Search( pattern, isBackward, currentMarkPosition, searchType )
+	if empty(a:pattern)
+		call s:NoMarkErrorMessage()
+		return 0
+	endif
+
 	let l:save_view = winsaveview()
 
 	" searchpos() obeys the 'smartcase' setting; however, this setting doesn't
@@ -754,18 +793,16 @@ function! mark#SearchAnyMark( isBackward )
 endfunction
 
 " Search last searched mark.
-function! mark#SearchNext( isBackward )
+function! mark#SearchNext( isBackward, ... )
 	let l:markText = mark#CurrentMark()[0]
 	if empty(l:markText)
-		return 0
-	else
-		if s:lastSearch == -1
-			call mark#SearchAnyMark(a:isBackward)
-		else
-			call mark#SearchCurrentMark(a:isBackward)
-		endif
-		return 1
+		return 0    " Fall back to the built-in * / # command (done by the mapping).
 	endif
+
+	" Use the provided search type or choose depending on last use of
+	" <Plug>MarkSearchCurrentNext / <Plug>MarkSearchAnyNext.
+	call call(a:0 ? a:1 : (s:lastSearch == -1 ? 'mark#SearchAnyMark' : 'mark#SearchCurrentMark'), [a:isBackward])
+	return 1
 endfunction
 
 " Load mark patterns from list.
@@ -792,12 +829,12 @@ function! mark#ToPatternList()
 	" may differ on the next invocation (e.g. due to a different number of
 	" highlight groups in Vim and GVIM). We want to keep empty patterns in the
 	" front and middle to maintain the mapping to highlight groups, though.
-	let l:highestNonEmptyIndex = s:markNum -1
+	let l:highestNonEmptyIndex = s:markNum - 1
 	while l:highestNonEmptyIndex >= 0 && empty(s:pattern[l:highestNonEmptyIndex])
 		let l:highestNonEmptyIndex -= 1
 	endwhile
 
-	return (l:highestNonEmptyIndex < 0 ? [] : s:pattern[0:l:highestNonEmptyIndex])
+	return (l:highestNonEmptyIndex < 0 ? [] : s:pattern[0 : l:highestNonEmptyIndex])
 endfunction
 
 " :MarkLoad command.
@@ -935,6 +972,23 @@ function! mark#GetGroupNum()
 endfunction
 
 
+"- integrations ----------------------------------------------------------------
+
+" Access the number of possible marks.
+function! mark#GetNum()
+	return s:markNum
+endfunction
+
+" Access the current / passed index pattern.
+function! mark#GetPattern( ... )
+	if a:0
+		return s:pattern[a:1]
+	else
+		return (s:lastSearch == -1 ? '' : s:pattern[s:lastSearch])
+	endif
+endfunction
+
+
 "- initializations ------------------------------------------------------------
 augroup Mark
 	autocmd!
@@ -952,6 +1006,26 @@ function! mark#Init()
 	let s:cycle = 0
 	let s:lastSearch = -1
 	let s:enabled = 1
+endfunction
+function! mark#ReInit( newMarkNum )
+	if a:newMarkNum < s:markNum " There are less marks than before.
+		" Clear the additional highlight groups.
+		for i in range(a:newMarkNum + 1, s:markNum)
+			execute 'highlight clear MarkWord' . (i + 1)
+		endfor
+
+		" Truncate the mark patterns.
+		let s:pattern = s:pattern[0 : (a:newMarkNum - 1)]
+
+		" Correct any indices.
+		let s:cycle = min([s:cycle, (a:newMarkNum - 1)])
+		let s:lastSearch = (s:lastSearch < a:newMarkNum ? s:lastSearch : -1)
+	elseif a:newMarkNum > s:markNum " There are more marks than before.
+		" Expand the mark patterns.
+		let s:pattern += repeat([''], (a:newMarkNum - s:markNum))
+	endif
+
+	let s:markNum = a:newMarkNum
 endfunction
 
 call mark#Init()
